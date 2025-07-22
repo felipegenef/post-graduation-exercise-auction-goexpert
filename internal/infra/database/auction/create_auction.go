@@ -26,7 +26,7 @@ type AuctionEntityMongo struct {
 
 type AuctionTimer struct {
 	EndTime time.Time
-	EndChan chan bool
+	EndChan *chan bool
 }
 type AuctionRepository struct {
 	Collection    *mongo.Collection
@@ -68,7 +68,7 @@ func (ar *AuctionRepository) CreateAuction(
 	// Saves this info if needed to manually delete or to be accessed during runtime
 	ar.AuctionTimers[auctionEntity.Id] = AuctionTimer{
 		EndTime: time.Now().Add(autionDuration),
-		EndChan: endChan,
+		EndChan: &endChan,
 	}
 	go func() {
 		select {

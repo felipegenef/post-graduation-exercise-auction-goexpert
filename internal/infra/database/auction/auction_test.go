@@ -1,82 +1,148 @@
-// File: internal/infra/database/auction/create_auction_test.go
 package auction
 
 import (
 	"context"
+	"fullcycle-auction_go/configuration/database/mongodb"
 	"fullcycle-auction_go/internal/entity/auction_entity"
+	"log"
+	"os"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
-	"go.mongodb.org/mongo-driver/mongo"
-	mongo_options "go.mongodb.org/mongo-driver/mongo/options"
+	"github.com/joho/godotenv"
+	"go.mongodb.org/mongo-driver/bson"
 )
 
-// -- Mocks --
-
-type MockCollection struct {
-	mock.Mock
+func LoadEnv() {
+	if err := godotenv.Load("../../../../cmd/auction/.env"); err != nil {
+		log.Fatal("Error trying to load env variables %w", err)
+	}
 }
 
-func (m *MockCollection) InsertOne(ctx context.Context, document interface{}, opts ...*mongo_options.InsertOneOptions) (*mongo.InsertOneResult, error) {
-	args := m.Called(ctx, document)
-	return args.Get(0).(*mongo.InsertOneResult), args.Error(1)
+func CleanupTest(ctx context.Context, repo *AuctionRepository, auctionId string) {
+	repo.Collection.DeleteOne(ctx, bson.M{"_id": auctionId})
 }
 
-func (m *MockCollection) UpdateByID(ctx context.Context, id interface{}, update interface{}, opts ...*mongo_options.UpdateOptions) (*mongo.UpdateResult, error) {
-	args := m.Called(ctx, id, update)
-	return args.Get(0).(*mongo.UpdateResult), args.Error(1)
+func TestAuctionAutoClose(t *testing.T) {
+	LoadEnv()
+
+	ctx := context.Background()
+
+	os.Setenv("AUCTION_INTERVAL", "2s")
+	os.Setenv("MONGODB_URL", "mongodb://admin:admin@localhost:27017/auctions?authSource=admin")
+
+	databaseConnection, err := mongodb.NewMongoDBConnection(ctx)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+	repo := NewAuctionRepository(databaseConnection)
+
+	auction, _ := auction_entity.CreateAuction(
+		"Product Test", "Tests", "A test product created to check if auction is deleted", auction_entity.New,
+	)
+
+	repo.CreateAuction(ctx, auction)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		time.Sleep(1 * time.Second)
+
+		var result AuctionEntityMongo
+		err := repo.Collection.FindOne(ctx, bson.M{"_id": auction.Id}).Decode(&result)
+		if err != nil {
+			t.Errorf("Failed to find auction after 1s: %v", err)
+			CleanupTest(ctx, repo, auction.Id)
+			return
+		}
+
+		if result.Status != auction_entity.Active {
+			t.Errorf("Expected auction to be Active after 1s, got: %v", result.Status)
+			CleanupTest(ctx, repo, auction.Id)
+			return
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		time.Sleep(3 * time.Second)
+
+		var result AuctionEntityMongo
+		err := repo.Collection.FindOne(ctx, bson.M{"_id": auction.Id}).Decode(&result)
+		if err != nil {
+			t.Errorf("Failed to find auction after 10s: %v", err)
+			CleanupTest(ctx, repo, auction.Id)
+			return
+		}
+
+		if result.Status != auction_entity.Completed {
+			t.Errorf("Expected auction to be Completed after 2s, got: %v", result.Status)
+			CleanupTest(ctx, repo, auction.Id)
+		}
+	}()
+
+	wg.Wait()
+	CleanupTest(ctx, repo, auction.Id)
 }
 
-func (m *MockCollection) FindOne(ctx context.Context, filter interface{}, opts ...*mongo_options.FindOneOptions) *mongo.SingleResult {
-	args := m.Called(ctx, filter)
-	return args.Get(0).(*mongo.SingleResult)
-}
+func TestAuctionManualClose(t *testing.T) {
+	LoadEnv()
 
-func (m *MockCollection) Find(ctx context.Context, filter interface{}, opts ...*mongo_options.FindOptions) (*mongo.Cursor, error) {
-	args := m.Called(ctx, filter)
-	return args.Get(0).(*mongo.Cursor), args.Error(1)
-}
+	ctx := context.Background()
 
-// MockDatabase implements IMongoDatabase
-type MockDatabase struct {
-	mock.Mock
-}
+	os.Setenv("AUCTION_INTERVAL", "10s")
+	os.Setenv("MONGODB_URL", "mongodb://admin:admin@localhost:27017/auctions?authSource=admin")
 
-func (m *MockDatabase) Collection(name string) IMongoCollection {
-	args := m.Called(name)
-	return args.Get(0).(IMongoCollection)
-}
+	databaseConnection, err := mongodb.NewMongoDBConnection(ctx)
 
-func TestCreateAuction_AutoClosesAfterDuration(t *testing.T) {
-	mockCollection := new(MockCollection)
-	mockDB := new(MockDatabase)
+	if err != nil {
+		log.Fatal(err)
+	}
+	repo := NewAuctionRepository(databaseConnection)
 
-	mockDB.On("Collection", "auctions").Return(mockCollection)
+	auction, _ := auction_entity.CreateAuction(
+		"Product Test", "Tests", "A test product created to check if auction is deleted", auction_entity.New,
+	)
 
-	repo := NewAuctionRepository(&mongo.Database{}) // Now takes IMongoDatabase interface
+	repo.CreateAuction(ctx, auction)
 
-	auction, _ := auction_entity.CreateAuction("Product Test", "Test", "Test Description", auction_entity.New)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	// Setup expectations
-	mockCollection.
-		On("InsertOne", mock.Anything, mock.Anything).
-		Return(&mongo.InsertOneResult{}, nil)
+	time.Sleep(1 * time.Second)
 
-	mockCollection.
-		On("UpdateByID", mock.Anything, auction.Id, mock.Anything).
-		Return(&mongo.UpdateResult{}, nil)
+	var result AuctionEntityMongo
+	if err := repo.Collection.FindOne(ctx, bson.M{"_id": auction.Id}).Decode(&result); err != nil {
+		t.Errorf("Failed to find auction after 1s: %v", err)
+		CleanupTest(ctx, repo, auction.Id)
+		return
+	}
 
-	// Set short auction duration
-	t.Setenv("AUCTION_DURATION", "1s")
+	if result.Status != auction_entity.Active {
+		t.Errorf("Expected auction to be Active after 1s, got: %v", result.Status)
+		CleanupTest(ctx, repo, auction.Id)
+		return
+	}
 
-	err := repo.CreateAuction(context.Background(), auction)
-	assert.Nil(t, err)
+	*repo.AuctionTimers[auction.Id].EndChan <- true
 
-	// Wait for the auction to close automatically
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(time.Second)
 
-	mockCollection.AssertCalled(t, "InsertOne", mock.Anything, mock.Anything)
-	mockCollection.AssertCalled(t, "UpdateByID", mock.Anything, auction.Id, mock.Anything)
+	if err := repo.Collection.FindOne(ctx, bson.M{"_id": auction.Id}).Decode(&result); err != nil {
+		t.Errorf("Failed to find auction after 1s: %v", err)
+		CleanupTest(ctx, repo, auction.Id)
+		return
+	}
+
+	if result.Status != auction_entity.Completed {
+		t.Errorf("Expected auction to be Completed after manual close, got: %v", result.Status)
+		CleanupTest(ctx, repo, auction.Id)
+		return
+	}
+	CleanupTest(ctx, repo, auction.Id)
+
 }
